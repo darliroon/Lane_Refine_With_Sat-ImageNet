@@ -128,16 +128,18 @@ def validate(model, loader, cfg, log, compute_apls=True, distributed=False) -> d
         return {}
 
     if distributed:
-        # 各进程只看到部分验证样本，汇总后再算均值
-        local = torch.tensor([np.mean([a[k] for a in agg]) for k in agg[0]], dtype=torch.float64, device=dev)
-        cnt = torch.tensor([float(len(agg))], dtype=torch.float64, device=dev)
-        gathered = [torch.zeros_like(local) for _ in range(torch.distributed.get_world_size())]
-        counts = [torch.zeros_like(cnt) for _ in range(torch.distributed.get_world_size())]
-        torch.distributed.all_gather(gathered, local)
-        torch.distributed.all_gather(counts, cnt)
-        total = torch.stack(counts).sum()
-        merged = (torch.stack(gathered) * torch.stack(counts)).sum(0) / total.clamp(min=1)
-        return {k: float(v) for k, v in zip(agg[0].keys(), merged.cpu())}
+        # 各进程只看到部分验证样本。对每个指标分别汇总"有效值之和"与"有效值个数"，
+        # 与单卡的 nanmean 等价：apls 为 nan 的样本既不进分子也不进分母。
+        keys = list(agg[0].keys())
+        vals = np.array([[a[k] for k in keys] for a in agg], dtype=np.float64)  # (N, K)
+        valid = ~np.isnan(vals)
+        s = torch.tensor(np.where(valid, vals, 0.0).sum(0), dtype=torch.float64, device=dev)
+        n = torch.tensor(valid.sum(0), dtype=torch.float64, device=dev)
+        torch.distributed.all_reduce(s)
+        torch.distributed.all_reduce(n)
+        # 所有进程上都没有有效值时保持 nan，而不是伪造成 0
+        merged = torch.where(n > 0, s / n.clamp(min=1), torch.full_like(s, float("nan")))
+        return {k: float(v) for k, v in zip(keys, merged.cpu())}
 
     # apls 在退化的 GT 上返回 nan，用 nanmean 跳过这些样本
     return {k: float(np.nanmean([a[k] for a in agg])) for k in agg[0]}
